@@ -68,7 +68,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, repository.Repository, str
 	})
 
 	// Create auth router and IDP router
-	authRouter, err := auth.NewAuthRouter([]string{}, false, nil)
+	authRouter, err := auth.NewAuthRouter([]string{}, false, nil, auth.NewFlowCookies(secret[:], false))
 	require.NoError(t, err)
 
 	logger, _ := zap.NewDevelopment()
@@ -639,4 +639,88 @@ func TestAccessTokenPreservesUserIdentity(t *testing.T) {
 	require.True(t, ok, "userinfo claim should be present")
 	require.Equal(t, "test-user@example.com", userinfo["email"])
 	require.Equal(t, "Test User", userinfo["name"])
+}
+
+// Claude's desktop app opens one authorization request per configured MCP
+// server at the same moment. Pending request IDs were kept as a list in the
+// shared session cookie, so each response replaced the whole list and the
+// browser kept only the last: in production 12 of 15 consent pages answered
+// "invalid authorization session" (2026-09-30). Every request started in
+// this browser must still be recognised.
+func TestConcurrentAuthorizationRequests(t *testing.T) {
+	const flows = 16
+
+	server, _, _ := setupTestServer(t)
+	regResp := registerTestClient(t, server.URL)
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	// Every request leaves before any response is applied, as in a browser.
+	var reqs []*http.Request
+	for i := 0; i < flows; i++ {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf(
+			"%s%s?response_type=code&client_id=%s&redirect_uri=%s&state=concurrent-state-%d",
+			server.URL, AuthorizationEndpoint, regResp.ClientID,
+			url.QueryEscape("http://localhost:8080/callback"), i), nil)
+		require.NoError(t, err)
+		for _, c := range jar.Cookies(req.URL) {
+			req.AddCookie(c)
+		}
+		reqs = append(reqs, req)
+	}
+	var locations []string
+	var cookies [][]*http.Cookie
+	for _, req := range reqs {
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusFound, resp.StatusCode)
+		locations = append(locations, resp.Header.Get("Location"))
+		cookies = append(cookies, resp.Cookies())
+	}
+	for i, req := range reqs {
+		jar.SetCookies(req.URL, cookies[i])
+	}
+
+	client.Jar = jar
+	for i, loc := range locations {
+		resp, err := client.Post(server.URL+loc, "application/x-www-form-urlencoded", nil)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusSeeOther, resp.StatusCode, "request %d was not recognised", i)
+		callback, err := url.Parse(resp.Header.Get("Location"))
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("concurrent-state-%d", i), callback.Query().Get("state"))
+		require.NotEmpty(t, callback.Query().Get("code"))
+	}
+}
+
+// A consent POST must not be replayable once it has issued a code.
+func TestAuthorizationRequestCompletesOnce(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+	regResp := registerTestClient(t, server.URL)
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	resp, err := client.Get(fmt.Sprintf("%s%s?response_type=code&client_id=%s&redirect_uri=%s&state=once-state",
+		server.URL, AuthorizationEndpoint, regResp.ClientID, url.QueryEscape("http://localhost:8080/callback")))
+	require.NoError(t, err)
+	resp.Body.Close()
+	loc := resp.Header.Get("Location")
+
+	resp, err = client.Post(server.URL+loc, "application/x-www-form-urlencoded", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	resp, err = client.Post(server.URL+loc, "application/x-www-form-urlencoded", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }

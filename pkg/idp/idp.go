@@ -102,7 +102,6 @@ const (
 	RegistrationEndpoint             = "/.idp/register"
 	OauthAuthorizationServerEndpoint = "/.well-known/oauth-authorization-server"
 	JWKSEndpoint                     = "/.well-known/jwks.json"
-	sessionKeyAuthorizeRequestIDs    = "idp_authorize_request_ids"
 )
 
 func (a *IDPRouter) SetupRoutes(router gin.IRouter) {
@@ -146,9 +145,10 @@ func (a *IDPRouter) handleAuth(c *gin.Context) {
 		a.provider.WriteAuthorizeError(ctx, c.Writer, ar, fosite.ErrServerError.WithWrap(err))
 		return
 	}
-	session := sessions.Default(c)
-	addAuthorizeRequestID(session, ar.GetID())
-	if err := session.Save(); err != nil {
+	// Bind the request to this browser with a cookie of its own. A shared
+	// list in the session cookie lost entries whenever a client opened
+	// several authorization requests at once.
+	if err := a.authRouter.Flows().SetAuthorizeRequest(c, ar.GetID()); err != nil {
 		a.logger.Error("Failed to save authorize request in session", zap.Error(err))
 		_ = a.repo.DeleteAuthorizeRequest(ctx, ar.GetID())
 		a.provider.WriteAuthorizeError(ctx, c.Writer, ar, fosite.ErrServerError.WithWrap(err))
@@ -159,7 +159,7 @@ func (a *IDPRouter) handleAuth(c *gin.Context) {
 
 func (a *IDPRouter) handleAuthorizationReturnForm(c *gin.Context) {
 	arID := c.Param("ar_id")
-	if !hasAuthorizeRequestID(sessions.Default(c), arID) {
+	if !a.authRouter.Flows().HasAuthorizeRequest(c, arID) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid authorization session"})
 		return
 	}
@@ -171,7 +171,7 @@ func (a *IDPRouter) handleAuthorizationReturn(c *gin.Context) {
 	ctx := c.Request.Context()
 	arID := c.Param("ar_id")
 	session := sessions.Default(c)
-	if !hasAuthorizeRequestID(session, arID) {
+	if !a.authRouter.Flows().HasAuthorizeRequest(c, arID) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid authorization session"})
 		return
 	}
@@ -216,61 +216,9 @@ func (a *IDPRouter) handleAuthorizationReturn(c *gin.Context) {
 		return
 	}
 
-	removeAuthorizeRequestID(session, arID)
-	if err := session.Save(); err != nil {
-		a.logger.Error("Failed to remove authorize request from session", zap.Error(err))
-		a.provider.WriteAuthorizeError(ctx, c.Writer, ar, fosite.ErrServerError.WithWrap(err))
-		return
-	}
+	a.authRouter.Flows().DeleteAuthorizeRequest(c, arID)
 
 	a.provider.WriteAuthorizeResponse(ctx, c.Writer, ar, response)
-}
-
-func authorizeRequestIDs(session sessions.Session) []string {
-	value, ok := session.Get(sessionKeyAuthorizeRequestIDs).(string)
-	if !ok || value == "" {
-		return nil
-	}
-	var ids []string
-	if err := json.Unmarshal([]byte(value), &ids); err != nil {
-		return nil
-	}
-	return ids
-}
-
-func addAuthorizeRequestID(session sessions.Session, arID string) {
-	ids := authorizeRequestIDs(session)
-	if hasAuthorizeRequestID(session, arID) {
-		return
-	}
-	ids = append(ids, arID)
-	data, _ := json.Marshal(ids)
-	session.Set(sessionKeyAuthorizeRequestIDs, string(data))
-}
-
-func hasAuthorizeRequestID(session sessions.Session, arID string) bool {
-	for _, id := range authorizeRequestIDs(session) {
-		if id == arID {
-			return true
-		}
-	}
-	return false
-}
-
-func removeAuthorizeRequestID(session sessions.Session, arID string) {
-	ids := authorizeRequestIDs(session)
-	remaining := ids[:0]
-	for _, id := range ids {
-		if id != arID {
-			remaining = append(remaining, id)
-		}
-	}
-	if len(remaining) == 0 {
-		session.Delete(sessionKeyAuthorizeRequestIDs)
-		return
-	}
-	data, _ := json.Marshal(remaining)
-	session.Set(sessionKeyAuthorizeRequestIDs, string(data))
 }
 
 func (a *IDPRouter) handleToken(c *gin.Context) {
