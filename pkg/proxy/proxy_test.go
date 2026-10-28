@@ -697,3 +697,39 @@ func TestProxyRouter_HTTPStreamingOnlyRejectsSSE(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyRouter_UnauthorizedAdvertisesResourceMetadata(t *testing.T) {
+	_, publicKey, err := generateRSAKeyPair()
+	require.NoError(t, err)
+
+	proxyRouter, err := NewProxyRouter("https://example.com/", http.NotFoundHandler(), publicKey, http.Header{}, false, false, nil, "/userinfo")
+	require.NoError(t, err)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	proxyRouter.SetupRoutes(router)
+
+	const metadata = `Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"`
+	cases := []struct {
+		name          string
+		authorization string
+		want          string
+	}{
+		{"no token", "", metadata},
+		{"not a bearer token", "Basic abc", metadata},
+		{"invalid token", "Bearer not-a-jwt", metadata + `, error="invalid_token"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusUnauthorized, w.Code)
+			assert.Equal(t, tc.want, w.Header().Get("WWW-Authenticate"))
+		})
+	}
+}

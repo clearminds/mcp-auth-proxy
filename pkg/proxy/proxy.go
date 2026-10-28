@@ -65,10 +65,23 @@ func (p *ProxyRouter) handleProtectedResource(c *gin.Context) {
 	})
 }
 
+// abortUnauthorized answers 401 with the WWW-Authenticate challenge MCP clients
+// use to discover the authorization server (RFC 9728, MCP spec 2025-06-18).
+// invalidToken adds error="invalid_token" (RFC 6750) for a token that was sent
+// but rejected.
+func (p *ProxyRouter) abortUnauthorized(c *gin.Context, message string, invalidToken bool) {
+	challenge := fmt.Sprintf(`Bearer resource_metadata="%s%s"`, strings.TrimRight(p.externalURL, "/"), OauthProtectedResourceEndpoint)
+	if invalidToken {
+		challenge += `, error="invalid_token"`
+	}
+	c.Header("WWW-Authenticate", challenge)
+	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": message})
+}
+
 func (p *ProxyRouter) handleProxy(c *gin.Context) {
 	authHeader := c.Request.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		p.abortUnauthorized(c, "Unauthorized", false)
 		return
 	}
 	bearerToken := strings.TrimPrefix(authHeader, "Bearer ")
@@ -82,7 +95,7 @@ func (p *ProxyRouter) handleProxy(c *gin.Context) {
 	}, jwt.WithIssuer(p.externalURL), jwt.WithAudience(p.externalURL))
 
 	if err != nil || !token.Valid {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		p.abortUnauthorized(c, "Invalid token", true)
 		return
 	}
 
