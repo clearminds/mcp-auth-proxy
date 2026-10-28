@@ -87,7 +87,7 @@ func (p *ProxyRouter) protectedResourceMetadataURL(requestPath string) string {
 }
 
 func (p *ProxyRouter) setWWWAuthenticate(c *gin.Context, invalidToken bool) {
-	challenge := fmt.Sprintf(`Bearer resource_metadata="%s"`, p.protectedResourceMetadataURL(c.Request.URL.Path))
+	challenge := fmt.Sprintf(`Bearer resource_metadata="%s"`, p.protectedResourceMetadataURL(c.Request.URL.EscapedPath()))
 	if invalidToken {
 		challenge += `, error="invalid_token"`
 	}

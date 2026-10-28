@@ -790,3 +790,25 @@ func TestProxyRouter_HTTPStreamingOnlyRejectsSSE(t *testing.T) {
 		})
 	}
 }
+
+// The challenge is built from the request path; a decoded quote must not be able
+// to end the resource_metadata quoted-string and inject its own parameters.
+func TestProxyRouter_ChallengeEscapesRequestPath(t *testing.T) {
+	_, publicKey, err := generateRSAKeyPair()
+	require.NoError(t, err)
+	gin.SetMode(gin.TestMode)
+
+	proxyRouter, err := NewProxyRouter("https://example.com", http.NotFoundHandler(), publicKey, http.Header{}, false, false, nil, "/userinfo")
+	require.NoError(t, err)
+	router := gin.New()
+	proxyRouter.SetupRoutes(router)
+
+	req := httptest.NewRequest(http.MethodPost, `/x%22,%20error=%22injected%5C`, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Equal(t,
+		`Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource/x%22,%20error=%22injected%5C"`,
+		w.Header().Get("WWW-Authenticate"))
+}
